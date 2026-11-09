@@ -9,6 +9,7 @@ the reply.
 
 Usage:
     python scripts/install.py [HERMES_WORKSPACE] [--dry-run]
+    python scripts/install.py [HERMES_WORKSPACE] --revert
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ import sys
 from pathlib import Path
 
 HELPER_SENTINEL = "def build_turn_usage_footer"
-BASELINE_SENTINEL = "_turn_start_total_tokens"
+BASELINE_SENTINEL = "record_turn_baseline"
+BASELINE_LEGACY = "_turn_start_total_tokens"
 HOOK_SENTINEL = "_tf_agent"
 
 
@@ -27,20 +29,46 @@ def helpers() -> str:
     return '''
 
 
+_TURN_BASELINES = {}
+
+
+def record_turn_baseline(agent) -> None:
+    """Snapshot the session counters at the start of a turn.
+
+    The snapshot lives here instead of on the agent because some builds reject
+    attributes they do not declare.
+    """
+    try:
+        _TURN_BASELINES[id(agent)] = (
+            int(getattr(agent, "session_prompt_tokens", 0) or 0),
+            int(getattr(agent, "session_completion_tokens", 0) or 0),
+            int(getattr(agent, "session_total_tokens", 0) or 0),
+        )
+    except Exception:
+        return
+    if len(_TURN_BASELINES) > 256:
+        for key in list(_TURN_BASELINES)[:-128]:
+            _TURN_BASELINES.pop(key, None)
+
+
 def build_turn_usage_footer(agent, markdown: bool = False) -> str:
-    """Return the token footer for the turn that just finished, or "" when the
-    counters are unknown."""
-    if agent is None or not hasattr(agent, "_turn_start_total_tokens"):
+    """Return the token footer for the turn that just finished.
+
+    Returns "" when no baseline was recorded for this agent, so a caller that
+    renders without a turn behind it shows nothing rather than a session total.
+    """
+    if agent is None:
+        return ""
+    baseline = _TURN_BASELINES.get(id(agent))
+    if baseline is None:
         return ""
 
     def total(name):
         return int(getattr(agent, name, 0) or 0)
 
-    prompt = total("session_prompt_tokens") - total("_turn_start_prompt_tokens")
-    completion = total("session_completion_tokens") - total(
-        "_turn_start_completion_tokens"
-    )
-    total_tokens = total("session_total_tokens") - total("_turn_start_total_tokens")
+    prompt = total("session_prompt_tokens") - baseline[0]
+    completion = total("session_completion_tokens") - baseline[1]
+    total_tokens = total("session_total_tokens") - baseline[2]
     if total_tokens <= 0:
         return ""
 
@@ -76,16 +104,11 @@ def token_footer_enabled(config, platform_key=None) -> bool:
 def baseline_block(indent: str, target: str) -> str:
     i = indent
     return (
-        f"{i}_tf_agent = {target}\n"
-        f'{i}_tf_total = getattr(_tf_agent, "session_total_tokens", None)\n'
-        f"{i}if _tf_total is not None:\n"
-        f"{i}    _tf_agent._turn_start_prompt_tokens = int(\n"
-        f'{i}        getattr(_tf_agent, "session_prompt_tokens", 0) or 0\n'
-        f"{i}    )\n"
-        f"{i}    _tf_agent._turn_start_completion_tokens = int(\n"
-        f'{i}        getattr(_tf_agent, "session_completion_tokens", 0) or 0\n'
-        f"{i}    )\n"
-        f"{i}    _tf_agent._turn_start_total_tokens = int(_tf_total or 0)\n"
+        f"{i}try:\n"
+        f"{i}    from agent.turn_usage import record_turn_baseline\n"
+        f"{i}    record_turn_baseline({target})\n"
+        f"{i}except Exception:\n"
+        f"{i}    pass\n"
     )
 
 
@@ -326,6 +349,9 @@ def patch_baseline(base: Path, dry_run: bool) -> bool:
         if BASELINE_SENTINEL in text:
             print(f"  ✓ turn baseline already present in {rel}")
             return True
+        if BASELINE_LEGACY in text:
+            print(f"  ! {rel} carries the old unguarded baseline; run --revert first")
+            return False
         tree = ast.parse(text)
         func = function_named(tree, "run_conversation")
         if func is None:
@@ -363,7 +389,9 @@ def patch_config_defaults(base: Path, dry_run: bool) -> bool:
     if display is None:
         print("  ✗ no display defaults dict found")
         return False
-    updated = add_key_after(text, display, "show_reasoning", '"show_token_usage": False,')
+    updated = add_key_after(
+        text, display, "show_reasoning", '"show_token_usage": False,'
+    )
     if updated is None:
         print("  ✗ display defaults dict has no literal keys")
         return False
@@ -385,10 +413,14 @@ def patch_display_config(base: Path, dry_run: bool) -> bool:
     tree = ast.parse(text)
     updated = text
     for node in sorted(dicts_with_key(tree, "streaming"), key=lambda d: -d.lineno):
-        result = add_key_after(updated, node, "streaming", '"show_token_usage": False,')
+        result = add_key_after(
+            updated, node, "streaming", '"show_token_usage": False,'
+        )
         if result is not None:
             updated = result
-    result = add_to_overrideable_keys(updated, ast.parse(updated), '"show_token_usage",')
+    result = add_to_overrideable_keys(
+        updated, ast.parse(updated), '"show_token_usage",'
+    )
     if result is not None:
         updated = result
     if updated == text:
@@ -418,7 +450,11 @@ def patch_cli(base: Path, dry_run: bool) -> bool:
     if stmt is None:
         print("  ✗ could not resolve the statement rendering the reply")
         return False
-    var = call.args[0].id if call.args and isinstance(call.args[0], ast.Name) else "response"
+    var = (
+        call.args[0].id
+        if call.args and isinstance(call.args[0], ast.Name)
+        else "response"
+    )
     block = cli_block(" " * stmt.col_offset, var)
     if not save(path, insert_block(text, stmt.lineno, block), dry_run):
         return False
@@ -449,8 +485,22 @@ def patch_gateway(base: Path, dry_run: bool) -> bool:
     return True
 
 
+def revert(base: Path) -> int:
+    restored = 0
+    for bak in sorted(base.rglob("*.py.bak")):
+        target = bak.with_suffix("")
+        shutil.copy2(bak, target)
+        print(f"  ✓ restored {target.relative_to(base)}")
+        restored += 1
+    if not restored:
+        print("  ! no *.py.bak backups found")
+        return 1
+    return 0
+
+
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
+    revert_requested = "--revert" in sys.argv
     positional = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
 
     print("🔧 Token Usage Monitoring Installer")
@@ -461,6 +511,14 @@ def main() -> int:
         print(f"✗ {exc}")
         return 1
     print(f"Hermes at: {base}\n")
+
+    if revert_requested:
+        print("[revert]")
+        code = revert(base)
+        print("-" * 40)
+        if code == 0:
+            print("✅ Backups restored. Restart with: hermes gateway restart")
+        return code
 
     steps = [
         ("footer helpers", patch_helpers),
