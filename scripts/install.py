@@ -1,413 +1,488 @@
 #!/usr/bin/env python3
-"""Auto-install token-usage footer patches into Hermes core.
+"""Install the token-usage footer into Hermes.
 
-This script is idempotent — running it multiple times is safe.
-It creates .bak backups before modifying any file.
+Insertion points are located structurally (AST), never by exact text, and every
+edited file is syntax-checked before it is written. An anchor that cannot be
+found is reported and skipped instead of guessed at. Each inserted hook is
+wrapped in a guard, so a hook that cannot resolve a name costs the footer, not
+the reply.
+
+Usage:
+    python scripts/install.py [HERMES_WORKSPACE] [--dry-run]
 """
 
 from __future__ import annotations
 
-import re
+import ast
 import shutil
 import sys
 from pathlib import Path
 
+HELPER_SENTINEL = "def build_turn_usage_footer"
+BASELINE_SENTINEL = "_turn_start_total_tokens"
+HOOK_SENTINEL = "_tf_agent"
 
-def find_hermes_agent_dir() -> Path:
-    """Locate the hermes-agent source directory."""
+
+def helpers() -> str:
+    return '''
+
+
+def build_turn_usage_footer(agent, markdown: bool = False) -> str:
+    """Return the token footer for the turn that just finished, or "" when the
+    counters are unknown."""
+    if agent is None or not hasattr(agent, "_turn_start_total_tokens"):
+        return ""
+
+    def total(name):
+        return int(getattr(agent, name, 0) or 0)
+
+    prompt = total("session_prompt_tokens") - total("_turn_start_prompt_tokens")
+    completion = total("session_completion_tokens") - total(
+        "_turn_start_completion_tokens"
+    )
+    total_tokens = total("session_total_tokens") - total("_turn_start_total_tokens")
+    if total_tokens <= 0:
+        return ""
+
+    model = getattr(agent, "model", "") or "unknown"
+    line = (
+        f"📊 Tokens: ↑{prompt:,} ↓{completion:,} "
+        f"| Total: {total_tokens:,} | Model: {model}"
+    )
+    return f"\\n\\n---\\n*{line}*" if markdown else f"\\n\\n---\\n{line}"
+
+
+def token_footer_enabled(config, platform_key=None) -> bool:
+    """True when display.show_token_usage is on, honouring per-platform
+    overrides where the gateway resolver is importable."""
+    if platform_key:
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            return bool(
+                resolve_display_setting(
+                    config, platform_key, "show_token_usage", False
+                )
+            )
+        except Exception:
+            pass
+    try:
+        return bool((config.get("display") or {}).get("show_token_usage"))
+    except Exception:
+        return False
+'''
+
+
+def baseline_block(indent: str, target: str) -> str:
+    i = indent
+    return (
+        f"{i}_tf_agent = {target}\n"
+        f'{i}_tf_total = getattr(_tf_agent, "session_total_tokens", None)\n'
+        f"{i}if _tf_total is not None:\n"
+        f"{i}    _tf_agent._turn_start_prompt_tokens = int(\n"
+        f'{i}        getattr(_tf_agent, "session_prompt_tokens", 0) or 0\n'
+        f"{i}    )\n"
+        f"{i}    _tf_agent._turn_start_completion_tokens = int(\n"
+        f'{i}        getattr(_tf_agent, "session_completion_tokens", 0) or 0\n'
+        f"{i}    )\n"
+        f"{i}    _tf_agent._turn_start_total_tokens = int(_tf_total or 0)\n"
+    )
+
+
+def _agent_lookup(indent: str) -> str:
+    i = indent
+    return (
+        f'{i}    _tf_agent = locals().get("agent")\n'
+        f"{i}    if _tf_agent is None:\n"
+        f"{i}        try:\n"
+        f'{i}            _tf_agent = getattr(self, "agent", None)\n'
+        f"{i}        except NameError:\n"
+        f"{i}            _tf_agent = None\n"
+    )
+
+
+def cli_block(indent: str, var: str) -> str:
+    i = indent
+    return (
+        f"{i}try:\n"
+        f"{i}    from agent.turn_usage import (\n"
+        f"{i}        build_turn_usage_footer,\n"
+        f"{i}        token_footer_enabled,\n"
+        f"{i}    )\n"
+        f"{i}    from hermes_cli.config import load_config as _tf_load_config\n"
+        + _agent_lookup(i)
+        + f"{i}    if _tf_agent is not None and token_footer_enabled(_tf_load_config()):\n"
+        f"{i}        {var} += build_turn_usage_footer(_tf_agent, markdown=True)\n"
+        f"{i}except Exception:\n"
+        f"{i}    pass\n"
+    )
+
+
+def gateway_block(indent: str, var: str) -> str:
+    i = indent
+    return (
+        f"{i}try:\n"
+        f"{i}    from agent.turn_usage import (\n"
+        f"{i}        build_turn_usage_footer,\n"
+        f"{i}        token_footer_enabled,\n"
+        f"{i}    )\n"
+        + _agent_lookup(i)
+        + f"{i}    try:\n"
+        f"{i}        _tf_cfg = _load_gateway_config()\n"
+        f"{i}    except NameError:\n"
+        f"{i}        from hermes_cli.config import load_config as _tf_load_config\n"
+        f"{i}        _tf_cfg = _tf_load_config()\n"
+        f"{i}    if _tf_agent is not None and token_footer_enabled(_tf_cfg):\n"
+        f"{i}        {var} += build_turn_usage_footer(_tf_agent, markdown=True)\n"
+        f"{i}except Exception:\n"
+        f"{i}    pass\n"
+    )
+
+
+def find_hermes_agent_dir(explicit: str | None) -> Path:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
     try:
         import hermes_cli
-        base = Path(hermes_cli.__file__).resolve().parent.parent
-        if (base / "run_agent.py").exists():
-            return base
+
+        candidates.append(Path(hermes_cli.__file__).resolve().parent.parent)
     except Exception:
         pass
-
-    fallback = Path.home() / ".hermes" / "hermes-agent"
-    if (fallback / "run_agent.py").exists():
-        return fallback
-
+    home = Path.home() / ".hermes"
+    candidates.extend(sorted(home.glob("installs/*/environments/*/workspace")))
+    candidates.append(home / "hermes-agent")
+    for candidate in candidates:
+        if (candidate / "agent" / "turn_usage.py").exists():
+            return candidate
     raise RuntimeError(
-        "Could not locate hermes-agent directory. "
-        "Please run this script from inside the Hermes environment."
+        "Could not find the Hermes workspace. Pass it as the first argument, e.g.\n"
+        "  python scripts/install.py ~/.hermes/installs/<id>/environments/<id>/workspace"
     )
 
 
-def backup(path: Path) -> Path:
+def backup(path: Path) -> None:
     bak = path.with_suffix(path.suffix + ".bak")
-    if not bak.exists():
+    if path.exists() and not bak.exists():
         shutil.copy2(path, bak)
-    return bak
 
 
-def patch_run_agent(filepath: Path) -> bool:
-    text = filepath.read_text()
-    has_turn_deltas = (
-        "_turn_start_prompt_tokens" in text
-        and "turn_total_tokens" in text
-    )
-    has_fallback = "_FakeUsage" in text or "estimate_tokens_rough(_resp_content)" in text
-
-    if has_turn_deltas and has_fallback:
-        print("  ✓ run_agent.py already patched")
+def save(path: Path, text: str, dry_run: bool) -> bool:
+    try:
+        ast.parse(text)
+    except SyntaxError as exc:
+        print(f"  ✗ refusing to write {path}: result would not parse ({exc})")
+        return False
+    if dry_run:
+        print(f"  · would write {path.name}")
         return True
+    backup(path)
+    path.write_text(text)
+    return True
 
-    # 1. Insert turn start counters after api_call_count = 0
-    if not has_turn_deltas and "_turn_start_prompt_tokens" not in text:
-        anchor1 = "        api_call_count = 0\n"
-        insert1 = (
-            "        api_call_count = 0\n"
-            "        _turn_start_prompt_tokens = self.session_prompt_tokens\n"
-            "        _turn_start_completion_tokens = self.session_completion_tokens\n"
-            "        _turn_start_total_tokens = self.session_total_tokens\n"
-        )
-        if anchor1 not in text:
-            print("  ✗ Could not find anchor 'api_call_count = 0' in run_agent.py")
+
+def insert_block(text: str, lineno: int, block: str) -> str:
+    lines = text.splitlines(keepends=True)
+    lines.insert(lineno - 1, block)
+    return "".join(lines)
+
+
+def function_named(tree: ast.AST, name: str) -> ast.FunctionDef | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def first_param(func: ast.FunctionDef) -> str:
+    args = list(func.args.posonlyargs) + list(func.args.args)
+    return args[0].arg if args else "self"
+
+
+def call_name(call: ast.Call) -> str:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def find_call(tree: ast.AST, suffix: str) -> ast.Call | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and call_name(node).endswith(suffix):
+            return node
+    return None
+
+
+def statement_holding(tree: ast.AST, call: ast.Call) -> ast.stmt | None:
+    best = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        if not (node.lineno <= call.lineno and call.end_lineno <= node.end_lineno):
+            continue
+        span = node.end_lineno - node.lineno
+        if best is None or span < best[0]:
+            best = (span, node)
+    return best[1] if best else None
+
+
+def mentions(node: ast.AST, value: str) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and child.value == value:
+            return True
+    return False
+
+
+def final_response_assign(tree: ast.AST) -> ast.Assign | None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        if mentions(node.value, "final_response"):
+            return node
+    return None
+
+
+def nested_dict(tree: ast.AST, outer_key: str) -> ast.Dict | None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if (
+                isinstance(key, ast.Constant)
+                and key.value == outer_key
+                and isinstance(value, ast.Dict)
+            ):
+                return value
+    return None
+
+
+def dicts_with_key(tree: ast.AST, wanted: str) -> list[ast.Dict]:
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key in node.keys:
+            if isinstance(key, ast.Constant) and key.value == wanted:
+                found.append(node)
+                break
+    return found
+
+
+def add_key_after(text: str, node: ast.Dict, key: str, entry: str) -> str | None:
+    for item, value in zip(node.keys, node.values):
+        if isinstance(item, ast.Constant) and item.value == key:
+            indent = " " * value.col_offset
+            return insert_block(text, value.end_lineno + 1, f"{indent}{entry}\n")
+    for item in node.keys:
+        if isinstance(item, ast.Constant):
+            indent = " " * item.col_offset
+            return insert_block(text, item.lineno, f"{indent}{entry}\n")
+    return None
+
+
+def add_to_overrideable_keys(text: str, tree: ast.AST, entry: str) -> str | None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or "OVERRIDEABLE_KEYS" not in target.id:
+            continue
+        if not isinstance(node.value, (ast.Set, ast.List, ast.Tuple)):
+            continue
+        items = node.value.elts
+        if not items or items[0].lineno == items[-1].lineno:
+            continue
+        indent = " " * items[-1].col_offset
+        return insert_block(text, items[-1].end_lineno + 1, f"{indent}{entry}\n")
+    return None
+
+
+def patch_helpers(base: Path, dry_run: bool) -> bool:
+    path = base / "agent" / "turn_usage.py"
+    if not path.exists():
+        print("  ✗ agent/turn_usage.py not found")
+        return False
+    text = path.read_text()
+    if HELPER_SENTINEL in text:
+        print("  ✓ footer helpers already present")
+        return True
+    updated = text.rstrip("\n") + "\n" + helpers()
+    if not save(path, updated, dry_run):
+        return False
+    print("  ✓ added build_turn_usage_footer / token_footer_enabled")
+    return True
+
+
+def patch_baseline(base: Path, dry_run: bool) -> bool:
+    for rel in ("agent/conversation_loop.py", "agent/turn_facade.py"):
+        path = base / rel
+        if not path.exists():
+            continue
+        text = path.read_text()
+        if BASELINE_SENTINEL in text:
+            print(f"  ✓ turn baseline already present in {rel}")
+            return True
+        tree = ast.parse(text)
+        func = function_named(tree, "run_conversation")
+        if func is None:
+            continue
+        body = list(func.body)
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        if not body:
+            continue
+        anchor = body[0]
+        block = baseline_block(" " * anchor.col_offset, first_param(func))
+        if not save(path, insert_block(text, anchor.lineno, block), dry_run):
             return False
-        text = text.replace(anchor1, insert1, 1)
+        print(f"  ✓ sampled session counters at turn start in {rel}")
+        return True
+    print("  ✗ no run_conversation() found to sample the turn baseline")
+    return False
 
-        # 2. Insert turn deltas into the result dict
-        anchor2 = '            "total_tokens": self.session_total_tokens,\n'
-        insert2 = (
-            '            "total_tokens": self.session_total_tokens,\n'
-            '            "turn_prompt_tokens": self.session_prompt_tokens - _turn_start_prompt_tokens,\n'
-            '            "turn_completion_tokens": self.session_completion_tokens - _turn_start_completion_tokens,\n'
-            '            "turn_total_tokens": self.session_total_tokens - _turn_start_total_tokens,\n'
-        )
-        if anchor2 not in text:
-            print("  ✗ Could not find anchor 'total_tokens' result dict in run_agent.py")
+
+def patch_config_defaults(base: Path, dry_run: bool) -> bool:
+    path = base / "hermes_cli" / "config_defaults.py"
+    if not path.exists():
+        print("  ✗ hermes_cli/config_defaults.py not found")
+        return False
+    text = path.read_text()
+    if '"show_token_usage"' in text:
+        print("  ✓ display.show_token_usage already declared")
+        return True
+    display = nested_dict(ast.parse(text), "display")
+    if display is None:
+        print("  ✗ no display defaults dict found")
+        return False
+    updated = add_key_after(text, display, "show_reasoning", '"show_token_usage": False,')
+    if updated is None:
+        print("  ✗ display defaults dict has no literal keys")
+        return False
+    if not save(path, updated, dry_run):
+        return False
+    print("  ✓ declared display.show_token_usage = false")
+    return True
+
+
+def patch_display_config(base: Path, dry_run: bool) -> bool:
+    path = base / "gateway" / "display_config.py"
+    if not path.exists():
+        print("  ! gateway/display_config.py not found (skipping)")
+        return True
+    text = path.read_text()
+    if '"show_token_usage"' in text:
+        print("  ✓ gateway display defaults already declare show_token_usage")
+        return True
+    tree = ast.parse(text)
+    updated = text
+    for node in sorted(dicts_with_key(tree, "streaming"), key=lambda d: -d.lineno):
+        result = add_key_after(updated, node, "streaming", '"show_token_usage": False,')
+        if result is not None:
+            updated = result
+    result = add_to_overrideable_keys(updated, ast.parse(updated), '"show_token_usage",')
+    if result is not None:
+        updated = result
+    if updated == text:
+        print("  ! no display tier defaults found (skipping)")
+        return True
+    if not save(path, updated, dry_run):
+        return False
+    print("  ✓ declared show_token_usage in gateway display tiers")
+    return True
+
+
+def patch_cli(base: Path, dry_run: bool) -> bool:
+    path = base / "hermes_cli" / "cli_chat_turn_mixin.py"
+    if not path.exists():
+        print("  ✗ hermes_cli/cli_chat_turn_mixin.py not found")
+        return False
+    text = path.read_text()
+    if HOOK_SENTINEL in text:
+        print("  ✓ CLI footer already hooked")
+        return True
+    tree = ast.parse(text)
+    call = find_call(tree, "_render_final_assistant_content")
+    if call is None:
+        print("  ✗ no _render_final_assistant_content() call found")
+        return False
+    stmt = statement_holding(tree, call)
+    if stmt is None:
+        print("  ✗ could not resolve the statement rendering the reply")
+        return False
+    var = call.args[0].id if call.args and isinstance(call.args[0], ast.Name) else "response"
+    block = cli_block(" " * stmt.col_offset, var)
+    if not save(path, insert_block(text, stmt.lineno, block), dry_run):
+        return False
+    print(f"  ✓ footer appended to `{var}` before rendering")
+    return True
+
+
+def patch_gateway(base: Path, dry_run: bool) -> bool:
+    for rel in ("gateway/run_turn.py", "gateway/run_turn_runner.py", "gateway/run.py"):
+        path = base / rel
+        if not path.exists():
+            continue
+        text = path.read_text()
+        if HOOK_SENTINEL in text:
+            print(f"  ✓ gateway footer already hooked in {rel}")
+            return True
+        tree = ast.parse(text)
+        node = final_response_assign(tree)
+        if node is None:
+            continue
+        var = node.targets[0].id
+        block = gateway_block(" " * node.col_offset, var)
+        if not save(path, insert_block(text, node.end_lineno + 1, block), dry_run):
             return False
-        text = text.replace(anchor2, insert2, 1)
-
-    # 3. Insert usage fallback for providers that omit usage data
-    if not has_fallback:
-        # Try robust regex matching first (handles varying indentation)
-        pattern = re.compile(
-            r'^(\s*)(#\s*Track actual token usage from response for context management\s*\n)'
-            r'^\1if\s+hasattr\(\s*response\s*,\s*[\'"]usage[\'"]\s*\)\s+and\s+response\.usage\s*:\s*$',
-            re.MULTILINE,
-        )
-        match = pattern.search(text)
-        if match:
-            indent = match.group(1)
-            insert_pos = match.start()
-        else:
-            # Fallback: search just the if line with any indentation
-            pattern2 = re.compile(
-                r'^(\s*)if\s+hasattr\(\s*response\s*,\s*[\'"]usage[\'"]\s*\)\s+and\s+response\.usage\s*:\s*$',
-                re.MULTILINE,
-            )
-            match2 = pattern2.search(text)
-            if match2:
-                indent = match2.group(1)
-                insert_pos = match2.start()
-            else:
-                print("  ✗ Could not find anchor 'if hasattr(response, 'usage') and response.usage:' in run_agent.py")
-                return False
-
-        fallback_code = (
-            f"{indent}# Some providers (e.g. Chinese endpoints in streaming mode) omit\n"
-            f"{indent}# usage data. Inject a rough estimate so counters still work.\n"
-            f"{indent}if not (hasattr(response, 'usage') and response.usage):\n"
-            f"{indent}    from agent.model_metadata import estimate_tokens_rough\n"
-            f'{indent}    _resp_content = ""\n'
-            f"{indent}    if hasattr(response, 'choices') and response.choices:\n"
-            f"{indent}        _msg = response.choices[0].message\n"
-            f"{indent}        _resp_content = getattr(_msg, 'content', '') or ''\n"
-            f"{indent}    _completion = estimate_tokens_rough(_resp_content)\n"
-            f"{indent}    _prompt_texts = []\n"
-            f"{indent}    for m in messages[:-1]:\n"
-            f"{indent}        if isinstance(m, dict):\n"
-            f"{indent}            _prompt_texts.append(m.get('content', '') or '')\n"
-            f"{indent}        elif hasattr(m, 'content'):\n"
-            f"{indent}            _prompt_texts.append(m.content or '')\n"
-            f'{indent}    _prompt = estimate_tokens_rough("\\n".join(_prompt_texts))\n'
-            f"{indent}    class _FakeUsage:\n"
-            f"{indent}        prompt_tokens = _prompt\n"
-            f"{indent}        completion_tokens = _completion\n"
-            f"{indent}        total_tokens = _prompt + _completion\n"
-            f"{indent}    response.usage = _FakeUsage()\n"
-            f"\n"
-        )
-        text = text[:insert_pos] + fallback_code + text[insert_pos:]
-
-    backup(filepath)
-    filepath.write_text(text)
-    print("  ✓ run_agent.py patched")
-    return True
-
-
-def patch_config(filepath: Path) -> bool:
-    text = filepath.read_text()
-    if '"show_token_usage"' in text:
-        print("  ✓ hermes_cli/config.py already patched")
+        print(f"  ✓ footer appended to `{var}` before delivery ({rel})")
         return True
-
-    anchor = '        "show_reasoning": False,\n'
-    insert = '        "show_reasoning": False,\n        "show_token_usage": False,\n'
-    if anchor not in text:
-        print("  ✗ Could not find anchor 'show_reasoning' in hermes_cli/config.py")
-        return False
-
-    backup(filepath)
-    text = text.replace(anchor, insert, 1)
-    filepath.write_text(text)
-    print("  ✓ hermes_cli/config.py patched")
-    return True
-
-
-def patch_cli(filepath: Path) -> bool:
-    text = filepath.read_text()
-    if "turn_prompt_tokens" in text and 'CLI_CONFIG.get("display", {}).get("show_token_usage")' in text:
-        print("  ✓ cli.py already patched")
-        return True
-
-    # 1. Insert footer builder after response_previewed line
-    anchor1 = (
-        '            response_previewed = result.get("response_previewed", False) if result else False\n'
-    )
-    insert1 = (
-        '            response_previewed = result.get("response_previewed", False) if result else False\n\n'
-        '            # Build token-usage footer if enabled\n'
-        '            _token_footer = ""\n'
-        '            if result and CLI_CONFIG.get("display", {}).get("show_token_usage"):\n'
-        '                _t_in = result.get("turn_prompt_tokens", 0)\n'
-        '                _t_out = result.get("turn_completion_tokens", 0)\n'
-        '                _t_total = result.get("turn_total_tokens", 0)\n'
-        '                _t_model = result.get("model", self.model) or "unknown"\n'
-        '                _token_footer = f"\\n\\n---\\n📊 Tokens: ↑{_t_in:,} ↓{_t_out:,} | Total: {_t_total:,} | Model: {_t_model}"\n'
-    )
-    if anchor1 not in text:
-        print("  ✗ Could not find anchor 'response_previewed' in cli.py")
-        return False
-    text = text.replace(anchor1, insert1, 1)
-
-    # 2a. TTS streaming: append footer after box close
-    anchor2a = (
-        "                if use_streaming_tts and _streaming_box_opened and not is_error_response:\n"
-        "                    # Text was already printed sentence-by-sentence; just close the box\n"
-        "                    w = shutil.get_terminal_size().columns\n"
-        "                    _cprint(f\"\\n{_ACCENT}╯{'─' * (w - 2)}╭{_RST}\")\n"
-    )
-    insert2a = (
-        "                if use_streaming_tts and _streaming_box_opened and not is_error_response:\n"
-        "                    # Text was already printed sentence-by-sentence; just close the box\n"
-        "                    w = shutil.get_terminal_size().columns\n"
-        "                    _cprint(f\"\\n{_ACCENT}╯{'─' * (w - 2)}╭{_RST}\")\n"
-        "                    if _token_footer:\n"
-        "                        _cprint(_token_footer)\n"
-    )
-    if anchor2a in text:
-        text = text.replace(anchor2a, insert2a, 1)
-    else:
-        print("  ! Could not find TTS streaming anchor in cli.py (skipping)")
-
-    # 2b. Token streaming: append footer after box close
-    anchor2b = (
-        "                elif already_streamed:\n"
-        "                    # Response was already streamed token-by-token with box framing;\n"
-        "                    # _flush_stream() already closed the box. Skip Rich Panel.\n"
-    )
-    insert2b = (
-        "                elif already_streamed:\n"
-        "                    # Response was already streamed token-by-token with box framing;\n"
-        "                    # _flush_stream() already closed the box. Skip Rich Panel.\n"
-        "                    if _token_footer:\n"
-        "                        _cprint(_token_footer)\n"
-    )
-    if anchor2b in text:
-        text = text.replace(anchor2b, insert2b, 1)
-    else:
-        print("  ! Could not find token streaming anchor in cli.py (skipping)")
-
-    # 2c. Non-streaming: add footer to Panel
-    anchor2c_alt = (
-        "                    _chat_console.print(Panel(\n"
-        "                        _rich_text_from_ansi(response),\n"
-    )
-    insert2c_alt = (
-        "                    _chat_console.print(Panel(\n"
-        "                        _rich_text_from_ansi(response + _token_footer),\n"
-    )
-    if anchor2c_alt in text:
-        text = text.replace(anchor2c_alt, insert2c_alt, 1)
-    else:
-        print("  ✗ Could not find non-streaming Panel anchor in cli.py")
-        return False
-
-    backup(filepath)
-    filepath.write_text(text)
-    print("  ✓ cli.py patched")
-    return True
-
-
-def patch_gateway(filepath: Path) -> bool:
-    text = filepath.read_text()
-    if "_token_footer" in text and "turn_prompt_tokens" in text:
-        print("  ✓ gateway/run.py already patched")
-        return True
-
-    # 1. Insert footer builder after response = agent_result.get("final_response") or ""
-    anchor1 = '            response = agent_result.get("final_response") or ""\n'
-    insert1 = (
-        '            response = agent_result.get("final_response") or ""\n\n'
-        '            # Append token usage footer if enabled (before streaming check so\n'
-        '            # non-streaming responses include it without affecting TTS).\n'
-        '            _token_footer = ""\n'
-        '            if response:\n'
-        '                try:\n'
-        '                    from gateway.display_config import resolve_display_setting as _rds_token\n'
-        '                    _show_tokens = _rds_token(\n'
-        '                        _load_gateway_config(),\n'
-        '                        _platform_config_key(source.platform),\n'
-        '                        "show_token_usage",\n'
-        '                        False,\n'
-        '                    )\n'
-        '                    logger.debug("token footer _show_tokens=%s for platform=%s", _show_tokens, source.platform)\n'
-        '                    if _show_tokens:\n'
-        '                        _t_in = agent_result.get("turn_prompt_tokens", 0)\n'
-        '                        _t_out = agent_result.get("turn_completion_tokens", 0)\n'
-        '                        _t_total = agent_result.get("turn_total_tokens", 0)\n'
-        '                        _t_model = agent_result.get("model", "unknown")\n'
-        '                        _token_footer = f"\\n\\n---\\n*📊 Tokens: ↑{_t_in:,} ↓{_t_out:,} | Total: {_t_total:,} | Model: {_t_model}*"\n'
-        '                        response += _token_footer\n'
-        '                        logger.debug("token footer appended: %s", _token_footer)\n'
-        '                except Exception as _token_footer_err:\n'
-        '                    logger.debug("token footer append failed: %s", _token_footer_err)\n'
-    )
-    if anchor1 not in text:
-        print("  ✗ Could not find anchor 'response = agent_result.get(\"final_response\")' in gateway/run.py")
-        return False
-    text = text.replace(anchor1, insert1, 1)
-
-    # 2. Insert footer follow-up inside the already_sent block before return None
-    anchor2 = (
-        "            if agent_result.get(\"already_sent\") and not agent_result.get(\"failed\"):\n"
-        "                if response:\n"
-        "                    _media_adapter = self.adapters.get(source.platform)\n"
-        "                    if _media_adapter:\n"
-        "                        await self._deliver_media_from_response(\n"
-        "                            response, event, _media_adapter,\n"
-        "                        )\n"
-        "                return None\n"
-    )
-    insert2 = (
-        "            if agent_result.get(\"already_sent\") and not agent_result.get(\"failed\"):\n"
-        "                if response:\n"
-        "                    _media_adapter = self.adapters.get(source.platform)\n"
-        "                    if _media_adapter:\n"
-        "                        await self._deliver_media_from_response(\n"
-        "                            response, event, _media_adapter,\n"
-        "                        )\n"
-        "                    # Streaming already delivered the main text; send the\n"
-        "                    # token footer as a separate follow-up message so it\n"
-        "                    # still appears at the end of the reply.\n"
-        "                    if _token_footer:\n"
-        "                        _footer_adapter = self.adapters.get(source.platform)\n"
-        "                        if _footer_adapter:\n"
-        "                            try:\n"
-        '                                _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None\n'
-        "                                await _footer_adapter.send(\n"
-        "                                    event.source.chat_id,\n"
-        "                                    _token_footer,\n"
-        "                                    metadata=_thread_meta,\n"
-        "                                )\n"
-        "                            except Exception:\n"
-        "                                pass\n"
-        "                return None\n"
-    )
-    if anchor2 in text:
-        text = text.replace(anchor2, insert2, 1)
-    else:
-        print("  ! Could not find already_sent block in gateway/run.py (footer follow-up skipped)")
-
-    backup(filepath)
-    filepath.write_text(text)
-    print("  ✓ gateway/run.py patched")
-    return True
-
-
-def patch_display_config(filepath: Path) -> bool:
-    """Ensure show_token_usage exists in gateway/display_config.py defaults."""
-    text = filepath.read_text()
-    if '"show_token_usage"' in text:
-        print("  ✓ gateway/display_config.py already patched")
-        return True
-
-    anchor = '    "streaming": None,  # None = follow top-level streaming config\n'
-    insert = '    "show_token_usage": False,\n'
-    if anchor not in text:
-        print("  ! Could not find anchor in gateway/display_config.py (skipping)")
-        return True  # non-critical
-
-    backup(filepath)
-    text = text.replace(anchor, anchor + insert, 1)
-
-    for tier in ("_TIER_HIGH", "_TIER_MEDIUM", "_TIER_LOW", "_TIER_MINIMAL"):
-        tier_anchor = f'        "streaming": None,  # follow global\n'
-        tier_insert = '        "show_token_usage": False,\n'
-        parts = text.split(tier_anchor, 1)
-        if len(parts) == 2:
-            tier_block = parts[1].split("\n}", 1)[0]
-            if '"show_token_usage"' not in tier_block:
-                text = parts[0] + tier_anchor + tier_insert + tier_anchor.join(parts[1:])
-
-    filepath.write_text(text)
-    print("  ✓ gateway/display_config.py patched")
+    print("  ! no final_response assignment found (gateway footer skipped)")
     return True
 
 
 def main() -> int:
+    dry_run = "--dry-run" in sys.argv
+    positional = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+
     print("🔧 Token Usage Monitoring Installer")
     print("-" * 40)
-
     try:
-        base = find_hermes_agent_dir()
-    except RuntimeError as e:
-        print(f"✗ {e}")
+        base = find_hermes_agent_dir(positional[0] if positional else None)
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
         return 1
+    print(f"Hermes at: {base}\n")
 
-    print(f"Found Hermes at: {base}\n")
-
+    steps = [
+        ("footer helpers", patch_helpers),
+        ("turn baseline", patch_baseline),
+        ("config default", patch_config_defaults),
+        ("gateway defaults", patch_display_config),
+        ("CLI footer", patch_cli),
+        ("gateway footer", patch_gateway),
+    ]
     results = []
-    files = {
-        "run_agent.py": base / "run_agent.py",
-        "hermes_cli/config.py": base / "hermes_cli" / "config.py",
-        "cli.py": base / "cli.py",
-        "gateway/run.py": base / "gateway" / "run.py",
-        "gateway/display_config.py": base / "gateway" / "display_config.py",
-    }
-
-    for name, path in files.items():
-        print(f"Patching {name} ...")
-        if not path.exists():
-            print(f"  ✗ File not found: {path}")
-            results.append(False)
-            continue
-
-        if name == "run_agent.py":
-            results.append(patch_run_agent(path))
-        elif name == "hermes_cli/config.py":
-            results.append(patch_config(path))
-        elif name == "cli.py":
-            results.append(patch_cli(path))
-        elif name == "gateway/run.py":
-            results.append(patch_gateway(path))
-        elif name == "gateway/display_config.py":
-            results.append(patch_display_config(path))
+    for label, step in steps:
+        print(f"[{label}]")
+        results.append(step(base, dry_run))
 
     print("-" * 40)
     if all(results):
-        print("✅ All patches applied successfully.")
-        print("\nNext steps:")
-        print("  1. Set 'display.show_token_usage: true' in ~/.hermes/config.yaml")
-        print("  2. Restart the gateway if you use messaging platforms.")
+        print("✅ Patched. Enable it with:")
+        print("  hermes config set display.show_token_usage true")
+        print("  hermes gateway restart    # only if you use messaging platforms")
         return 0
-    else:
-        print("⚠ Some patches failed. Check the output above.")
-        print("If your Hermes version is different, you may need to apply the changes manually")
-        print("using the instructions in SKILL.md.")
-        return 1
+    print("⚠ Some steps failed; every applied edit is listed above and backed up as *.bak.")
+    return 1
 
 
 if __name__ == "__main__":
